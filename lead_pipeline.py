@@ -80,6 +80,7 @@ import re
 import signal
 import smtplib
 import uuid
+import socket
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
