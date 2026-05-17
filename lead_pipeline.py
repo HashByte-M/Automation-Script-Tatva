@@ -1,6 +1,6 @@
-"""
-lead_pipeline.py — Stateless Google Sheets CRM with Smart Batching & Reorder Logic
+# lead_pipeline.py — Stateless Google Sheets CRM with Smart Batching & Reorder Logic
 
+"""
 This script handles webhooks, logs to Google Sheets, sends immediate emails for urgent leads.
 It features strict deduplication, silently routes CSAT scores, and enforces strict rules 
 around when to send emails based on the presence of contact information and Ticket IDs.
@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 EMAIL_API_KEY  = os.getenv("EMAIL_API_KEY", "")
-SENDER_EMAIL   = os.getenv("SENDER_EMAIL", "noreply@company.com")
-TEAM_EMAIL     = os.getenv("TEAM_EMAIL", "team@company.com")
+SENDER_EMAIL   = os.getenv("SENDER_EMAIL", "info@adishila.in")
+TEAM_EMAIL     = os.getenv("TEAM_EMAIL", "team@adishila.in")
 SUPPORT_PHONE  = "+91 86301 79867"
 
 # Google Sheets Configuration
@@ -163,30 +163,40 @@ def send_customer_confirmation(lead: dict):
     phone = lead.get("PHONE") or "your registered contact number"
     date_str = datetime.now().strftime("%B %d, %Y")
     
-    subject = f"We've Received Your Callback Request – Ticket #{ticket_id}"
+    subject = f"We've Received Your Request – Ticket #{ticket_id} | AdiShila"
     body = f"""
-    <div style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; max-width: 600px; margin: 0 auto;">
-        <p>Dear {name},</p>
-        <p>Thank you for reaching out to Adishila! 🙏</p>
-        <p>We have successfully received your callback request, and we want you to know that your query is important to us.</p>
+    <div style="font-family: 'Inter', Arial, sans-serif; background-color: #0E0E0E; color: #FAF7F2; line-height: 1.6; max-width: 600px; margin: 0 auto; padding: 40px 30px; border-top: 4px solid #C8A96E;">
         
-        <div style="border-top: 2px solid #ddd; border-bottom: 2px solid #ddd; padding: 15px 0; margin: 25px 0;">
-            <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: bold;">📋 Your Ticket Details</h3>
-            <table style="width: 100%; border-collapse: collapse;">
-                <tr><td style="padding: 4px 0; width: 120px; color: #555;">Ticket ID</td><td style="padding: 4px 0; font-weight: bold;">: #{ticket_id}</td></tr>
-                <tr><td style="padding: 4px 0; color: #555;">Request Date</td><td style="padding: 4px 0; font-weight: bold;">: {date_str}</td></tr>
-                <tr><td style="padding: 4px 0; color: #555;">Status</td><td style="padding: 4px 0; font-weight: bold;">: Under Review</td></tr>
+        <div style="text-align: center; margin-bottom: 40px;">
+            <h1 style="font-family: 'Cormorant Garamond', Georgia, serif; color: #C8A96E; margin: 0; font-size: 32px; letter-spacing: 3px; font-weight: normal;">AdiShila</h1>
+            <p style="color: #9A9286; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; margin-top: 8px;">The Primordial Stone</p>
+        </div>
+
+        <p>Namaskaram {name},</p>
+        <p>Thank you for reaching out to AdiShila. 🙏</p>
+        <p>We have successfully received your callback request. Whether you are exploring our authentic Karelian Shungite for Vedic practices, Vastu correction, or personal wellness, your query is deeply important to us.</p>
+        
+        <div style="background-color: #1A1A1A; border: 1px solid rgba(200,169,110,0.2); padding: 25px; margin: 30px 0;">
+            <h3 style="font-family: 'Cormorant Garamond', Georgia, serif; margin: 0 0 20px 0; font-size: 18px; font-weight: normal; color: #C8A96E; letter-spacing: 1px;">📋 Your Ticket Details</h3>
+            <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                <tr><td style="padding: 6px 0; width: 120px; color: #9A9286;">Ticket ID</td><td style="padding: 6px 0; color: #FAF7F2;">: <strong>#{ticket_id}</strong></td></tr>
+                <tr><td style="padding: 6px 0; color: #9A9286;">Request Date</td><td style="padding: 6px 0; color: #FAF7F2;">: {date_str}</td></tr>
+                <tr><td style="padding: 6px 0; color: #9A9286;">Status</td><td style="padding: 6px 0; color: #C8A96E;">: Under Review</td></tr>
             </table>
         </div>
         
         <p>Our dedicated support team will get in touch with you within the next 48 hours on {phone}.</p>
-        <p>In the meantime, if you have any additional information to share or wish to update your query, feel free to reply to this email quoting your Ticket ID.</p>
-        <p>We appreciate your patience and look forward to assisting you!</p>
+        <p>In the meantime, if you have any additional information to share, feel free to reply directly to this email quoting your Ticket ID.</p>
+        <p>We appreciate your patience and look forward to assisting you on your wellness journey!</p>
         
-        <p style="margin-top: 30px;">
-            Warm regards,<br><strong>Customer Support Team</strong><br>Adishila.in<br>
-            📧 support@adishila.in<br>🌐 www.adishila.in<br>📞 {SUPPORT_PHONE}
-        </p>
+        <div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid rgba(200,169,110,0.1); font-size: 13px; color: #9A9286;">
+            Warm regards,<br>
+            <strong style="color: #C8A96E; font-size: 14px;">Customer Support Team</strong><br>
+            AdiShila<br><br>
+            📧 info@adishila.in<br>
+            🌐 www.adishila.in<br>
+            📞 {SUPPORT_PHONE}
+        </div>
     </div>
     """
     send_brevo_email(email, subject, body)
@@ -195,34 +205,43 @@ def send_immediate_team_notification(lead: dict, prior_ticket: str, intent: str,
     ticket_id = lead.get("TICKET_ID", "N/A")
     date_str = datetime.now().strftime("%d-%b-%Y")
     
-    subject_prefix = "REORDER" if "Reorder" in display_status else "Callback Assignment"
+    subject_prefix = "REORDER" if "Reorder" in display_status else "URGENT ASSIGNMENT"
     subject = f"{subject_prefix} | Ticket #{ticket_id} | {intent} | {date_str}"
     
     body = f"""
-    <div style="font-family: Arial, sans-serif; color: #333; line-height: 1.5; max-width: 650px;">
-        <p>Dear Resolution Team,</p>
-        <p>A new callback request has been assigned to your queue. Please find the customer details below and ensure contact is made within 48 hours.</p>
+    <div style="font-family: 'Inter', Arial, sans-serif; background-color: #0E0E0E; color: #FAF7F2; line-height: 1.5; max-width: 650px; margin: 0 auto; padding: 30px;">
         
-        <div style="background-color: #fcfcfc; border: 1px solid #ddd; padding: 20px; margin: 20px 0;">
-            <h3 style="margin: 0 0 15px 0; font-size: 15px; font-weight: bold; border-bottom: 1px solid #ccc; padding-bottom: 10px;">📋 CUSTOMER CALLBACK DETAILS</h3>
+        <div style="margin-bottom: 25px; padding-bottom: 15px; border-bottom: 1px solid rgba(200,169,110,0.2);">
+            <h1 style="font-family: 'Cormorant Garamond', Georgia, serif; color: #C8A96E; margin: 0; font-size: 24px; font-weight: normal;">AdiShila Internal Dispatch</h1>
+            <p style="color: #9A9286; font-size: 12px; margin-top: 5px;">Automated Ticket Routing System</p>
+        </div>
+
+        <p>Dear Resolution Team,</p>
+        <p>A new <strong style="color: #C8A96E;">high-priority</strong> callback request has been assigned to your queue. Please ensure contact is made within 48 hours.</p>
+        
+        <div style="background-color: #1A1A1A; border: 1px solid rgba(200,169,110,0.3); padding: 25px; margin: 25px 0;">
+            <h3 style="margin: 0 0 15px 0; font-size: 14px; font-weight: normal; color: #C8A96E; letter-spacing: 2px; text-transform: uppercase; border-bottom: 1px solid rgba(200,169,110,0.1); padding-bottom: 10px;">📋 Customer Callback Details</h3>
             <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-                <tr><td style="padding: 4px 0; width: 140px; color: #555;">Ticket ID</td><td style="padding: 4px 0;">: <strong>#{ticket_id}</strong></td></tr>
-                <tr><td style="padding: 4px 0; color: #555;">Name</td><td style="padding: 4px 0;">: {lead.get('NAME', 'N/A')}</td></tr>
-                <tr><td style="padding: 4px 0; color: #555;">Phone</td><td style="padding: 4px 0;">: {lead.get('PHONE', 'N/A')}</td></tr>
-                <tr><td style="padding: 4px 0; color: #555;">Email</td><td style="padding: 4px 0;">: {lead.get('EMAIL', 'N/A')}</td></tr>
-                <tr><td style="padding: 4px 0; color: #555;">Reason</td><td style="padding: 4px 0;">: {lead.get('REASON', 'N/A')}</td></tr>
-                <tr><td style="padding: 4px 0; color: #555;">Status</td><td style="padding: 4px 0; color: #d35400; font-weight: bold;">: {display_status}</td></tr>
-                <tr><td style="padding: 4px 0; color: #555;">Type / Intent</td><td style="padding: 4px 0;">: {intent}</td></tr>
-                <tr><td style="padding: 4px 0; color: #555;">Prior Ticket ID</td><td style="padding: 4px 0;">: {prior_ticket or 'N/A'}</td></tr>
+                <tr><td style="padding: 6px 0; width: 140px; color: #9A9286;">Ticket ID</td><td style="padding: 6px 0; color: #FAF7F2;">: <strong>#{ticket_id}</strong></td></tr>
+                <tr><td style="padding: 6px 0; color: #9A9286;">Name</td><td style="padding: 6px 0; color: #FAF7F2;">: {lead.get('NAME', 'N/A')}</td></tr>
+                <tr><td style="padding: 6px 0; color: #9A9286;">Phone</td><td style="padding: 6px 0; color: #FAF7F2;">: {lead.get('PHONE', 'N/A')}</td></tr>
+                <tr><td style="padding: 6px 0; color: #9A9286;">Email</td><td style="padding: 6px 0; color: #FAF7F2;">: {lead.get('EMAIL', 'N/A')}</td></tr>
+                <tr><td style="padding: 6px 0; color: #9A9286;">Reason</td><td style="padding: 6px 0; color: #FAF7F2;">: {lead.get('REASON', 'N/A')}</td></tr>
+                <tr><td style="padding: 6px 0; color: #9A9286;">Status</td><td style="padding: 6px 0; color: #E8D5A3; font-weight: bold;">: {display_status}</td></tr>
+                <tr><td style="padding: 6px 0; color: #9A9286;">Type / Intent</td><td style="padding: 6px 0; color: #FAF7F2;">: {intent}</td></tr>
+                <tr><td style="padding: 6px 0; color: #9A9286;">Prior Ticket ID</td><td style="padding: 6px 0; color: #FAF7F2;">: {prior_ticket or 'N/A'}</td></tr>
             </table>
         </div>
         
-        <p style="margin: 10px 0 5px 0; font-weight: bold;">⚠️ Action Required:</p>
-        <ul style="margin-top: 0; padding-left: 20px;">
-            <li style="margin-bottom: 5px;">If a Prior Ticket ID is listed, please review the previous interaction history before reaching out.</li>
-            <li style="margin-bottom: 5px;">Update the ticket status in the Google Sheets CRM after every interaction.</li>
-        </ul>
-        <p>Regards,<br>Automated Dispatch System<br>Adishila.in</p>
+        <div style="background-color: rgba(200,169,110,0.05); padding: 15px; border-left: 3px solid #C8A96E; margin-bottom: 25px;">
+            <p style="margin: 0 0 8px 0; font-weight: bold; color: #C8A96E; font-size: 13px;">⚠️ Action Required:</p>
+            <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: #9A9286;">
+                <li style="margin-bottom: 5px;">If a Prior Ticket ID is listed, review interaction history before calling.</li>
+                <li>Update ticket status in the Google Sheets CRM after every interaction.</li>
+            </ul>
+        </div>
+        
+        <p style="font-size: 12px; color: #9A9286;">Regards,<br>Automated Dispatch System<br>AdiShila</p>
     </div>
     """
     send_brevo_email(TEAM_EMAIL, subject, body)
@@ -239,51 +258,50 @@ def send_batch_team_notification(leads: list) -> bool:
     data_rows = ""
     for row in leads:
         data_rows += f"""
-        <tr>
-          <td style="padding: 8px; border: 1px solid #ddd; white-space: nowrap;">#{row.get('ticket_id', '')}</td>
-          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('name', 'N/A')}</td>
-          <td style="padding: 8px; border: 1px solid #ddd; white-space: nowrap;">{row.get('phone', 'N/A')}</td>
-          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('email', 'N/A')}</td>
-          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('reason', 'N/A')}</td>
-          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('status', '')}</td>
-          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('intent', 'Query')}</td>
-          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('language', 'N/A')}</td>
-          <td style="padding: 8px; border: 1px solid #ddd; white-space: nowrap;">{row.get('previous_ticket') or 'N/A'}</td>
+        <tr style="border-bottom: 1px solid #3D3D3D;">
+          <td style="padding: 12px 8px; color: #C8A96E; white-space: nowrap;">#{row.get('ticket_id', '')}</td>
+          <td style="padding: 12px 8px; color: #FAF7F2;">{row.get('name', 'N/A')}</td>
+          <td style="padding: 12px 8px; color: #FAF7F2; white-space: nowrap;">{row.get('phone', 'N/A')}</td>
+          <td style="padding: 12px 8px; color: #FAF7F2;">{row.get('email', 'N/A')}</td>
+          <td style="padding: 12px 8px; color: #9A9286; font-size: 13px;">{row.get('reason', 'N/A')}</td>
+          <td style="padding: 12px 8px; color: #E8D5A3;">{row.get('status', '')}</td>
+          <td style="padding: 12px 8px; color: #FAF7F2;">{row.get('intent', 'Query')}</td>
+          <td style="padding: 12px 8px; color: #FAF7F2;">{row.get('language', 'N/A')}</td>
+          <td style="padding: 12px 8px; color: #9A9286; white-space: nowrap;">{row.get('previous_ticket') or 'N/A'}</td>
         </tr>
         """
 
     body = f"""
-    <div style="font-family: Arial, sans-serif; color: #333; line-height: 1.5; max-width: 95%;">
-        <p>Dear Resolution Team,</p>
-        <p>Please find below the callback requests assigned to your queue for {date_str}. All customers must be contacted within 48 hours of their respective ticket creation time.</p>
+    <div style="font-family: 'Inter', Arial, sans-serif; background-color: #0E0E0E; color: #FAF7F2; line-height: 1.5; padding: 30px;">
         
-        <div style="background-color: #fcfcfc; border: 1px solid #ddd; padding: 20px; margin: 20px 0; max-width: 400px;">
-            <h3 style="margin: 0 0 15px 0; font-size: 15px; font-weight: bold; border-bottom: 1px solid #ccc; padding-bottom: 10px;">📊 ASSIGNMENT SUMMARY</h3>
-            <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-                <tr><td style="padding: 4px 0; color: #555;">Total New Tickets</td><td style="padding: 4px 0;">: <strong>{total_count}</strong></td></tr>
-            </table>
+        <div style="margin-bottom: 30px; padding-bottom: 15px; border-bottom: 1px solid rgba(200,169,110,0.2);">
+            <h1 style="font-family: 'Cormorant Garamond', Georgia, serif; color: #C8A96E; margin: 0; font-size: 24px; font-weight: normal;">AdiShila Batch Dispatch</h1>
+            <p style="color: #9A9286; font-size: 13px; margin-top: 5px;">Date: {date_str} | Total Assigned: <strong style="color: #C8A96E;">{total_count}</strong></p>
         </div>
+
+        <p style="color: #E8E4DC;">Dear Resolution Team,</p>
+        <p style="color: #9A9286; font-size: 14px;">Please find below the callback requests assigned to your queue for today. All customers must be contacted within 48 hours of their respective ticket creation time.</p>
         
-        <h3 style="margin: 25px 0 10px 0; font-size: 15px;">📋 CUSTOMER CALLBACK TABLE</h3>
-        <div style="overflow-x: auto;">
-            <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; min-width: 900px;">
+        <div style="overflow-x: auto; margin-top: 30px;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; min-width: 900px; background-color: #1A1A1A; border: 1px solid #3D3D3D;">
                 <thead>
-                    <tr style="background-color: #f5f5f5;">
-                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Ticket ID</th>
-                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Name</th>
-                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Phone</th>
-                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Email</th>
-                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Reason</th>
-                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Status</th>
-                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Intent</th>
-                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Language</th>
-                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Prior Ticket</th>
+                    <tr style="background-color: rgba(200,169,110,0.1); border-bottom: 2px solid #C8A96E;">
+                        <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Ticket ID</th>
+                        <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Name</th>
+                        <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Phone</th>
+                        <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Email</th>
+                        <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Reason</th>
+                        <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Status</th>
+                        <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Intent</th>
+                        <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Language</th>
+                        <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Prior Ticket</th>
                     </tr>
                 </thead>
                 <tbody>{data_rows}</tbody>
             </table>
         </div>
-        <p>Regards,<br>Automated Dispatch System<br>Adishila.in</p>
+        
+        <p style="margin-top: 30px; font-size: 12px; color: #9A9286;">Regards,<br>Automated Dispatch System<br>AdiShila</p>
     </div>
     """
     logger.info(f"Dispatching batch email via API for {total_count} leads.")
