@@ -93,6 +93,12 @@ from flask import Flask, jsonify, request
 
 import database as db
 
+ logging.basicConfig(
+        level   = logging.INFO,
+        format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt = "%Y-%m-%d %H:%M:%S",
+    )
+
 logger = logging.getLogger(__name__)
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
@@ -910,12 +916,6 @@ if os.getenv("RENDER"):
 
 if __name__ == "__main__":
     import argparse
-
-    logging.basicConfig(
-        level   = logging.INFO,
-        format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        datefmt = "%Y-%m-%d %H:%M:%S",
-    )
 
     parser = argparse.ArgumentParser(
         description="Lead pipeline webhook server — chatbot → automation workflow"
