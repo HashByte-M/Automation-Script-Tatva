@@ -92,6 +92,10 @@ from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, jsonify, request
 
 import database as db
+orig_getaddrinfo = socket.getaddrinfo
+def getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+    return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = getaddrinfo_ipv4
 logging.basicConfig(
         level   = logging.INFO,
         format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
