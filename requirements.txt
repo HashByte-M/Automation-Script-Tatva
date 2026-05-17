@@ -1,5 +1,4 @@
-# Lead pipeline — Python dependencies
-# Install with:  pip install -r requirements.txt
-
-flask>=3.0,<4.0           # Webhook HTTP server
-APScheduler>=3.10,<4.0    # Background batch scheduler
+flask>=3.0,<4.0
+APScheduler>=3.10,<4.0
+gunicorn==21.2.0
+psycopg2-binary==2.9.9
