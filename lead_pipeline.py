@@ -1,10 +1,9 @@
 """
 lead_pipeline.py — Stateless Google Sheets CRM with Smart Batching & Reorder Logic
 
-This script handles webhooks, logs to Google Sheets, sends immediate emails for 
-urgent leads, and holds low-priority leads. It safely ignores ghost leads.
-Includes strict CRM-level deduplication to prevent duplicate entries from webhook retries
-and intelligently updates existing rows if late CSAT scores arrive.
+This script handles webhooks, logs to Google Sheets, sends immediate emails for urgent leads.
+It features strict deduplication, silently routes CSAT scores, and enforces strict rules 
+around when to send emails based on the presence of contact information and Ticket IDs.
 """
 
 import hmac
@@ -14,6 +13,8 @@ import urllib.request
 import json
 import os
 import gspread
+import random
+import string
 from datetime import datetime
 from flask import Flask, jsonify, request
 
@@ -43,7 +44,6 @@ GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID")
 IMMEDIATE_KEYWORDS = ["buy", "purchase", "order", "price", "pricing", "quote", "wholesale", "urgent"]
 
 # Google Sheet Column Mapping (1-indexed for gspread)
-# Exactly matching: Timestamp | Ticket ID | Name | Phone | Email | Reason | Language | Status | Prior Ticket ID | CSAT | Frustration Score | Intent
 COL_DATE        = 1
 COL_TICKET      = 2
 COL_NAME        = 3
@@ -73,6 +73,12 @@ def _get_sheet():
         if "404" in str(e) or "SpreadsheetNotFound" in str(type(e).__name__):
             logger.error("CRITICAL: Google Sheet 404 Not Found! Ensure GOOGLE_SHEET_ID is correct and the service account email is added as an Editor.")
         raise e
+
+def generate_fallback_ticket_id() -> str:
+    """Generates a random ticket ID for orphan webhooks."""
+    p1 = ''.join(random.choices(string.ascii_uppercase + string.digits, k=5))
+    p2 = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"TKT-AUTO-{p1}-{p2}"
 
 def check_for_duplicate(sheet, phone: str, email: str) -> str:
     """Returns the previous Ticket ID if a duplicate customer exists (Reorder), else empty string."""
@@ -147,11 +153,14 @@ def send_brevo_email(to_email: str, subject: str, html_content: str) -> bool:
 
 def send_customer_confirmation(lead: dict):
     email = lead.get("EMAIL")
-    if not email: return
+    ticket_id = lead.get("TICKET_ID")
     
-    ticket_id = lead.get("TICKET_ID", "N/A")
+    # Strict rule: Must have email and ticket ID
+    if not email or not ticket_id or ticket_id == "N/A": 
+        return
+        
     name = lead.get("NAME", "Customer")
-    phone = lead.get("PHONE", "your registered contact number")
+    phone = lead.get("PHONE") or "your registered contact number"
     date_str = datetime.now().strftime("%B %d, %Y")
     
     subject = f"We've Received Your Callback Request – Ticket #{ticket_id}"
@@ -170,7 +179,7 @@ def send_customer_confirmation(lead: dict):
             </table>
         </div>
         
-        <p>Our dedicated support team will get in touch with you within the next 48 hours on your registered contact number: <strong>{phone}</strong> or email.</p>
+        <p>Our dedicated support team will get in touch with you within the next 48 hours on {phone}.</p>
         <p>In the meantime, if you have any additional information to share or wish to update your query, feel free to reply to this email quoting your Ticket ID.</p>
         <p>We appreciate your patience and look forward to assisting you!</p>
         
@@ -307,58 +316,77 @@ def webhook_lead():
     lead_data.update(payload.get("callback_data") or {})
     lead_data = {k.upper(): v for k, v in lead_data.items()}
     
-    ticket_id = lead_data.get("TICKET_ID")
+    # 1. Missing Ticket ID fallback
+    original_ticket_id = str(lead_data.get("TICKET_ID", "")).strip()
+    ticket_id = original_ticket_id
     
-    # 1. Immediate Sheet Duplicate & CSAT Update Check
-    # This prevents duplicate row creation AND processes delayed CSAT scores correctly.
+    if not ticket_id:
+        ticket_id = generate_fallback_ticket_id()
+        lead_data["TICKET_ID"] = ticket_id
+        logger.info(f"Generated fallback Ticket ID: {ticket_id}")
+
+    # 2. Determine Contactability and Payload Type
+    phone_val = str(lead_data.get("PHONE", "")).strip()
+    email_val = str(lead_data.get("EMAIL", "")).strip()
+    has_contact = bool(phone_val or email_val)
+    
+    has_metrics = bool(lead_data.get("CSAT") or lead_data.get("FRUSTRATION_SCORE"))
+    is_metrics_only = has_metrics and not has_contact
+
+    # 3. Connect to sheet and process updates vs. new
     try:
         sheet = _get_sheet()
-        if ticket_id:
-            try:
-                cell = sheet.find(ticket_id, in_column=COL_TICKET)
-                # If we get here, the ticket ALREADY exists in the sheet.
-                updated_something = False
-                
-                csat = lead_data.get("CSAT")
-                frustration = lead_data.get("FRUSTRATION_SCORE")
-                
-                if csat:
-                    sheet.update_cell(cell.row, COL_CSAT, csat)
-                    logger.info(f"Appended late CSAT ({csat}) to existing Ticket #{ticket_id}")
-                    updated_something = True
-                    
-                if frustration:
-                    sheet.update_cell(cell.row, COL_FRUSTRATION, frustration)
-                    logger.info(f"Appended late Frustration Score ({frustration}) to existing Ticket #{ticket_id}")
-                    updated_something = True
-                
-                if updated_something:
-                    return jsonify({"status": "updated_existing", "message": "Metrics appended to existing row."}), 200
-                else:
-                    logger.warning(f"Blocked webhook retry: Ticket #{ticket_id} is already in the CRM.")
-                    return jsonify({"status": "ignored", "reason": "duplicate_webhook"}), 200
-                    
-            except Exception:
-                # 'find' throws an exception if the cell is not found. 
-                # This means it's a completely new ticket. Proceed normally.
-                pass
     except Exception as e:
         logger.error(f"Failed to connect to sheet during initial check: {e}")
         sheet = None
 
-    # 2. Check Contactability (The "Ghost Lead" Check)
-    has_contact = bool(lead_data.get("PHONE") or lead_data.get("EMAIL"))
+    if sheet and original_ticket_id:
+        try:
+            cell = sheet.find(original_ticket_id, in_column=COL_TICKET)
+            # If we get here, the TICKET ALREADY EXISTS in the CRM.
+            
+            if has_metrics:
+                # Silently append the CSAT score to the existing row
+                csat = lead_data.get("CSAT")
+                frust = lead_data.get("FRUSTRATION_SCORE")
+                
+                if csat: 
+                    sheet.update_cell(cell.row, COL_CSAT, csat)
+                    logger.info(f"Silently updated CSAT ({csat}) for existing Ticket #{original_ticket_id}")
+                if frust: 
+                    sheet.update_cell(cell.row, COL_FRUSTRATION, frust)
+                    logger.info(f"Silently updated Frustration Score ({frust}) for existing Ticket #{original_ticket_id}")
 
-    # 3. Determine Intent
+            if is_metrics_only:
+                # Mission accomplished. It was just a CSAT score, we updated it. Stop here.
+                return jsonify({"status": "updated_existing", "message": "Metrics appended to existing row."}), 200
+            else:
+                # It's a full callback request, but the ID already exists. 
+                # This means it's a TatvaBot retry (or a refresh glitch). Block it.
+                logger.warning(f"Blocked webhook retry: Ticket #{original_ticket_id} is already in the CRM.")
+                return jsonify({"status": "ignored", "reason": "duplicate_webhook"}), 200
+                
+        except Exception:
+            # 'find' throws an exception if the cell is not found. 
+            # This means it's a completely new ticket. Proceed normally.
+            pass
+
+    # 4. If we get here, the ticket is NEW (either generated, or provided but not in CRM).
+    
+    if is_metrics_only:
+        # It's an orphan CSAT score (no contact info, no existing ticket).
+        # We log it directly to the CRM and EXIT immediately so no emails are sent.
+        append_to_google_sheet(lead_data, "", "CSAT Logged", "CSAT Only (No Contact)")
+        return jsonify({"status": "csat_logged_silently", "message": "New row created for orphan metrics."}), 200
+
+    # 5. Process normal Callback Request (Determine Intent & Status)
     reason = str(lead_data.get("REASON", "")).lower()
     intent = "Immediate" if any(kw in reason for kw in IMMEDIATE_KEYWORDS) else "Query"
 
-    # 4. Check for Returning Customer (Reorders)
     prior_ticket = ""
     if sheet:
-        prior_ticket = check_for_duplicate(sheet, lead_data.get("PHONE"), lead_data.get("EMAIL"))
+        prior_ticket = check_for_duplicate(sheet, phone_val, email_val)
 
-    # 5. Determine Dynamic Statuses
     if not has_contact:
         crm_status = "Unreachable"
         email_status = "Unreachable"
@@ -375,11 +403,14 @@ def webhook_lead():
         crm_status = "Recurring" if prior_ticket else "New"
         email_status = crm_status
 
-    # 6. Save to CRM (All leads get logged, regardless of contactability)
+    # 6. Save new lead to CRM
     append_to_google_sheet(lead_data, prior_ticket, intent, crm_status)
 
-    # 7. Send Emails (Only if contactable)
-    if lead_data.get("EMAIL"):
+    # 7. Send Emails Strict Logic
+    valid_email = bool(email_val)
+    valid_ticket = bool(lead_data.get("TICKET_ID"))
+
+    if valid_email and valid_ticket:
         send_customer_confirmation(lead_data)
         
     if intent == "Immediate" and has_contact:
@@ -393,6 +424,7 @@ def process_batches():
     Endpoint triggered by an external cron service.
     Finds all un-notified leads in Google Sheets, sends a batch email, 
     and updates their status to 'Notified'.
+    Ghost leads ('Unreachable') are intentionally ignored.
     """
     provided_key = request.args.get("key")
     if WEBHOOK_SECRET and provided_key != WEBHOOK_SECRET:
@@ -407,7 +439,6 @@ def process_batches():
         
         # Row 1 is headers, so data starts at Row 2
         for idx, row in enumerate(records, start=2):
-            # Check multiple potential keys to be safe, standardizing on the exact string
             status = str(row.get("Status", row.get("STATUS", "")))
             
             # Grabs only standard priority items waiting for batching
