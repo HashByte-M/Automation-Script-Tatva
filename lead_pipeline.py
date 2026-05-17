@@ -516,7 +516,7 @@ def _deduplicate(lead: ProcessedLead) -> ProcessedLead:
 
 def _send_smtp(to: str, subject: str, body_html: str) -> bool:
     """
-    Send one email via SMTP/TLS.
+    Send one email via SMTP/TLS or SSL.
     Returns True on success, False on any failure.
     Never raises — the pipeline must keep running regardless.
     """
@@ -528,14 +528,25 @@ def _send_smtp(to: str, subject: str, body_html: str) -> bool:
     msg.attach(MIMEText(body_html, "html"))
 
     try:
-        with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=10) as server:
+        # Increased timeout to 30s for slower cloud cold-starts
+        timeout_secs = 30 
+        
+        # Automatically handle the difference between Port 465 (SSL) and 587 (TLS)
+        if cfg.smtp_port == 465:
+            server = smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, timeout=timeout_secs)
+        else:
+            server = smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=timeout_secs)
             if cfg.use_tls:
                 server.starttls()
+                
+        with server:
             if cfg.smtp_user and cfg.smtp_password:
                 server.login(cfg.smtp_user, cfg.smtp_password)
             server.sendmail(cfg.sender_email, [to], msg.as_string())
+            
         logger.debug("Email sent → %s | %s", to, subject)
         return True
+        
     except smtplib.SMTPRecipientsRefused:
         logger.error("Email rejected for recipient: %s", to)
     except smtplib.SMTPAuthenticationError:
@@ -544,9 +555,8 @@ def _send_smtp(to: str, subject: str, body_html: str) -> bool:
         logger.error("SMTP connection timed out for %s.", to)
     except Exception as exc:
         logger.error("Unexpected email error for %s: %s", to, exc)
+        
     return False
-
-
 def _lead_row_html(row: dict) -> str:
     cells = "".join(
         f"<td style='padding:4px 8px;border:1px solid #ddd'>{v or ''}</td>"
