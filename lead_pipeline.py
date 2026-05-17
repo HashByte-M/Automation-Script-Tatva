@@ -2,8 +2,9 @@
 lead_pipeline.py — Stateless Google Sheets CRM with Smart Batching & Reorder Logic
 
 This script handles webhooks, logs to Google Sheets, sends immediate emails for 
-urgent leads (including high-priority returning customers), and holds low-priority 
-leads. It safely ignores and silences any leads that have no contact information.
+urgent leads, and holds low-priority leads. It safely ignores ghost leads.
+Includes strict CRM-level deduplication to prevent duplicate entries from webhook retries
+and intelligently updates existing rows if late CSAT scores arrive.
 """
 
 import hmac
@@ -42,18 +43,19 @@ GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID")
 IMMEDIATE_KEYWORDS = ["buy", "purchase", "order", "price", "pricing", "quote", "wholesale", "urgent"]
 
 # Google Sheet Column Mapping (1-indexed for gspread)
+# Exactly matching: Timestamp | Ticket ID | Name | Phone | Email | Reason | Language | Status | Prior Ticket ID | CSAT | Frustration Score | Intent
 COL_DATE        = 1
 COL_TICKET      = 2
 COL_NAME        = 3
 COL_PHONE       = 4
 COL_EMAIL       = 5
 COL_REASON      = 6
-COL_CSAT        = 7
-COL_LANGUAGE    = 8
-COL_FRUSTRATION = 9
-COL_STATUS      = 10
-COL_PRIOR_TKT   = 11
-COL_INTENT      = 12  # Tracks if it's Immediate or Query
+COL_LANGUAGE    = 7
+COL_STATUS      = 8
+COL_PRIOR_TKT   = 9
+COL_CSAT        = 10
+COL_FRUSTRATION = 11
+COL_INTENT      = 12
 
 # ============================================================================
 # GOOGLE SHEETS INTEGRATION (THE CRM)
@@ -65,10 +67,15 @@ def _get_sheet():
         raise ValueError("Missing Google Sheets credentials.")
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     gc = gspread.service_account_from_dict(creds_dict)
-    return gc.open_by_key(GOOGLE_SHEET_ID).sheet1
+    try:
+        return gc.open_by_key(GOOGLE_SHEET_ID).sheet1
+    except Exception as e:
+        if "404" in str(e) or "SpreadsheetNotFound" in str(type(e).__name__):
+            logger.error("CRITICAL: Google Sheet 404 Not Found! Ensure GOOGLE_SHEET_ID is correct and the service account email is added as an Editor.")
+        raise e
 
 def check_for_duplicate(sheet, phone: str, email: str) -> str:
-    """Returns the previous Ticket ID if a duplicate exists, else empty string."""
+    """Returns the previous Ticket ID if a duplicate customer exists (Reorder), else empty string."""
     if not phone and not email:
         return ""
     try:
@@ -79,37 +86,25 @@ def check_for_duplicate(sheet, phone: str, email: str) -> str:
             if (phone and phone in row_phone) or (email and email.lower() == row_email.lower()):
                 return str(row.get("TICKET_ID", "") or row.get("Ticket ID", ""))
     except Exception as e:
-        logger.error(f"Error checking for duplicates: {e}")
+        logger.error(f"Error checking for duplicates in CRM: {e}")
     return ""
-
-def update_csat_in_sheet(ticket_id: str, csat_score: float) -> bool:
-    try:
-        sheet = _get_sheet()
-        cell = sheet.find(ticket_id, in_column=COL_TICKET)
-        if cell:
-            sheet.update_cell(cell.row, COL_CSAT, csat_score)
-            logger.info(f"Successfully updated CSAT ({csat_score}) for Ticket #{ticket_id}")
-            return True
-    except Exception as e:
-        logger.error(f"Failed to update CSAT in sheet: {e}")
-    return False
 
 def append_to_google_sheet(lead_data: dict, prior_ticket: str, intent: str, status: str) -> None:
     try:
         sheet = _get_sheet()
         row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            lead_data.get("TICKET_ID", "N/A"),
-            lead_data.get("NAME", ""),
-            lead_data.get("PHONE", ""),
-            lead_data.get("EMAIL", ""),
-            lead_data.get("REASON", ""),
-            lead_data.get("CSAT", ""),
-            lead_data.get("LANGUAGE", "en"),
-            lead_data.get("FRUSTRATION_SCORE", ""),
-            status,
-            prior_ticket,
-            intent
+            lead_data.get("TICKET_ID") or "N/A",
+            lead_data.get("NAME") or "N/A",
+            lead_data.get("PHONE") or "N/A",
+            lead_data.get("EMAIL") or "N/A",
+            lead_data.get("REASON") or "N/A",
+            lead_data.get("LANGUAGE") or "N/A",
+            status or "N/A",
+            prior_ticket or "N/A",
+            lead_data.get("CSAT") or "N/A",
+            lead_data.get("FRUSTRATION_SCORE") or "N/A",
+            intent or "N/A"
         ]
         sheet.append_row(row)
         logger.info(f"Added Ticket #{lead_data.get('TICKET_ID')} to CRM. Status: {status}")
@@ -191,7 +186,6 @@ def send_immediate_team_notification(lead: dict, prior_ticket: str, intent: str,
     ticket_id = lead.get("TICKET_ID", "N/A")
     date_str = datetime.now().strftime("%d-%b-%Y")
     
-    # Highlight the subject line if it's a reorder to grab attention immediately
     subject_prefix = "REORDER" if "Reorder" in display_status else "Callback Assignment"
     subject = f"{subject_prefix} | Ticket #{ticket_id} | {intent} | {date_str}"
     
@@ -290,18 +284,18 @@ def send_batch_team_notification(leads: list) -> bool:
 # WEBHOOK SERVER & ENDPOINTS
 # ============================================================================
 
-app = Flask(__name__)
+_flask_app = Flask(__name__)
 
 def verify_signature(body: bytes, sig_header: str) -> bool:
     if not WEBHOOK_SECRET: return True
     expected = "sha256=" + hmac.new(WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, sig_header or "")
 
-@app.route("/health", methods=["GET"])
+@_flask_app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "mode": "google_sheets_batching_reorders"}), 200
 
-@app.route("/webhook/lead", methods=["POST"])
+@_flask_app.route("/webhook/lead", methods=["POST"])
 def webhook_lead():
     if not verify_signature(request.data, request.headers.get("X-Hub-Signature-256", "")):
         return jsonify({"error": "invalid signature"}), 401
@@ -315,28 +309,56 @@ def webhook_lead():
     
     ticket_id = lead_data.get("TICKET_ID")
     
-    # Check if this is just a CSAT update coming 10 seconds later
-    is_csat_only = lead_data.get("CSAT") is not None and not any([lead_data.get("NAME"), lead_data.get("PHONE"), lead_data.get("EMAIL")])
-    if is_csat_only:
-        update_csat_in_sheet(ticket_id, lead_data.get("CSAT"))
-        return jsonify({"status": "csat_updated"}), 200
+    # 1. Immediate Sheet Duplicate & CSAT Update Check
+    # This prevents duplicate row creation AND processes delayed CSAT scores correctly.
+    try:
+        sheet = _get_sheet()
+        if ticket_id:
+            try:
+                cell = sheet.find(ticket_id, in_column=COL_TICKET)
+                # If we get here, the ticket ALREADY exists in the sheet.
+                updated_something = False
+                
+                csat = lead_data.get("CSAT")
+                frustration = lead_data.get("FRUSTRATION_SCORE")
+                
+                if csat:
+                    sheet.update_cell(cell.row, COL_CSAT, csat)
+                    logger.info(f"Appended late CSAT ({csat}) to existing Ticket #{ticket_id}")
+                    updated_something = True
+                    
+                if frustration:
+                    sheet.update_cell(cell.row, COL_FRUSTRATION, frustration)
+                    logger.info(f"Appended late Frustration Score ({frustration}) to existing Ticket #{ticket_id}")
+                    updated_something = True
+                
+                if updated_something:
+                    return jsonify({"status": "updated_existing", "message": "Metrics appended to existing row."}), 200
+                else:
+                    logger.warning(f"Blocked webhook retry: Ticket #{ticket_id} is already in the CRM.")
+                    return jsonify({"status": "ignored", "reason": "duplicate_webhook"}), 200
+                    
+            except Exception:
+                # 'find' throws an exception if the cell is not found. 
+                # This means it's a completely new ticket. Proceed normally.
+                pass
+    except Exception as e:
+        logger.error(f"Failed to connect to sheet during initial check: {e}")
+        sheet = None
 
-    # 1. Check Contactability (The "Ghost Lead" Check)
+    # 2. Check Contactability (The "Ghost Lead" Check)
     has_contact = bool(lead_data.get("PHONE") or lead_data.get("EMAIL"))
 
-    # 2. Determine Intent
+    # 3. Determine Intent
     reason = str(lead_data.get("REASON", "")).lower()
     intent = "Immediate" if any(kw in reason for kw in IMMEDIATE_KEYWORDS) else "Query"
 
-    # 3. Check Deduplication
-    try:
-        sheet = _get_sheet()
+    # 4. Check for Returning Customer (Reorders)
+    prior_ticket = ""
+    if sheet:
         prior_ticket = check_for_duplicate(sheet, lead_data.get("PHONE"), lead_data.get("EMAIL"))
-    except Exception:
-        prior_ticket = ""
 
-    # 4. Determine Dynamic Statuses
-    # We separate 'crm_status' (how the batcher reads it) from 'email_status' (what humans read).
+    # 5. Determine Dynamic Statuses
     if not has_contact:
         crm_status = "Unreachable"
         email_status = "Unreachable"
@@ -353,10 +375,10 @@ def webhook_lead():
         crm_status = "Recurring" if prior_ticket else "New"
         email_status = crm_status
 
-    # 5. Save to CRM (All leads get logged, regardless of contactability)
+    # 6. Save to CRM (All leads get logged, regardless of contactability)
     append_to_google_sheet(lead_data, prior_ticket, intent, crm_status)
 
-    # 6. Send Emails (Only if contactable)
+    # 7. Send Emails (Only if contactable)
     if lead_data.get("EMAIL"):
         send_customer_confirmation(lead_data)
         
@@ -365,7 +387,7 @@ def webhook_lead():
 
     return jsonify({"status": "success", "intent": intent, "contactable": has_contact, "crm_status": crm_status}), 200
 
-@app.route("/cron/batch", methods=["GET", "POST"])
+@_flask_app.route("/cron/batch", methods=["GET", "POST"])
 def process_batches():
     """
     Endpoint triggered by an external cron service.
@@ -385,6 +407,7 @@ def process_batches():
         
         # Row 1 is headers, so data starts at Row 2
         for idx, row in enumerate(records, start=2):
+            # Check multiple potential keys to be safe, standardizing on the exact string
             status = str(row.get("Status", row.get("STATUS", "")))
             
             # Grabs only standard priority items waiting for batching
@@ -428,4 +451,4 @@ def process_batches():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    _flask_app.run(host="0.0.0.0", port=port, debug=False)
