@@ -1,362 +1,139 @@
 """
-lead_pipeline.py — Chatbot webhook receiver + full lead automation pipeline.
+lead_pipeline.py — Stateless Google Sheets CRM with Smart Batching & Reorder Logic
 
-This script uses an HTTP Email API (Brevo) to bypass all cloud SMTP restrictions,
-guaranteeing reliable email delivery without port blocking or connection timeouts.
+This script handles webhooks, logs to Google Sheets, sends immediate emails for 
+urgent leads (including high-priority returning customers), and holds low-priority 
+leads. It safely ignores and silences any leads that have no contact information.
 """
 
-from __future__ import annotations
-
-import atexit
-import hashlib
 import hmac
+import hashlib
 import logging
-import re
-import signal
-import uuid
 import urllib.request
 import json
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
-
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
+import os
+import gspread
+from datetime import datetime
 from flask import Flask, jsonify, request
 
-import database as db
-
-# --- LOGGING CONFIGURATION FOR GUNICORN ---
+# --- LOGGING CONFIGURATION ---
 logging.basicConfig(
-    level   = logging.INFO,
-    format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    datefmt = "%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-logging.getLogger(__name__).addHandler(logging.NullHandler())
-# ------------------------------------------
 
 # ============================================================================
-# SECTION 1 — ENUMS & MODELS
+# CONFIGURATION
 # ============================================================================
 
-class LeadType(str, Enum):
-    ESCALATION = "Escalation"
-    CALLBACK   = "Callback"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+EMAIL_API_KEY  = os.getenv("EMAIL_API_KEY", "")
+SENDER_EMAIL   = os.getenv("SENDER_EMAIL", "noreply@company.com")
+TEAM_EMAIL     = os.getenv("TEAM_EMAIL", "team@company.com")
+SUPPORT_PHONE  = "+91 86301 79867"
 
-class CallbackTier(str, Enum):
-    SUCCESSFUL = "Successful"
-    FAILED     = "Failed"
+# Google Sheets Configuration
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
+GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID")
 
-class CallbackIntent(str, Enum):
-    IMMEDIATE = "Immediate"
-    QUERY     = "Query"
+# Keywords for classification
+IMMEDIATE_KEYWORDS = ["buy", "purchase", "order", "price", "pricing", "quote", "wholesale", "urgent"]
 
-class LeadStatus(str, Enum):
-    NEW       = "New"
-    DUPLICATE = "Duplicate"
-    RECURRING = "Recurring"
-    NOTIFIED  = "Notified"
-
-class DispatchQueue(str, Enum):
-    IMMEDIATE  = "immediate"
-    QUERY      = "query"
-    ESCALATION = "escalation"
-    FAILED     = "failed"
-
-@dataclass
-class RawLead:
-    NAME:        Optional[str]   = None
-    PHONE:       Optional[str]   = None
-    EMAIL:       Optional[str]   = None
-    REASON:      Optional[str]   = None
-    EVENT:       Optional[str]   = None
-    TICKET_ID:   Optional[str]   = None
-    SESSION_ID:  Optional[str]   = None
-    CSAT:        Optional[float] = None
-    LANGUAGE:    Optional[str]   = None
-    FRUSTRATION: Optional[int]   = None
-    TURN_COUNT:  Optional[int]   = None
-
-    def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items()}
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "RawLead":
-        flat = {k: v for k, v in data.items() if k != "callback_data"}
-        flat.update(data.get("callback_data") or {})
-        flat = {k.upper(): v for k, v in flat.items()}
-
-        aliases = {
-            "FRUSTRATION_SCORE": "FRUSTRATION",
-            "TURN_COUNT":        "TURN_COUNT",
-        }
-        for src_key, dest_key in aliases.items():
-            if src_key in flat and dest_key not in flat:
-                flat[dest_key] = flat.pop(src_key)
-
-        known = set(cls.__dataclass_fields__)
-        return cls(**{k: v for k, v in flat.items() if k in known})
-
-@dataclass
-class ProcessedLead:
-    raw:             RawLead
-    lead_type:       Optional[LeadType]       = None
-    callback_tier:   Optional[CallbackTier]   = None
-    callback_intent: Optional[CallbackIntent] = None
-    status:          LeadStatus               = LeadStatus.NEW
-    previous_ticket_id: Optional[str]         = None
-    validation_errors:  List[str]             = field(default_factory=list)
-    processed_at:    datetime                 = field(default_factory=datetime.utcnow)
-    run_id:          str                      = field(default_factory=lambda: str(uuid.uuid4()))
-
-    @property
-    def is_valid(self) -> bool:
-        return not self.validation_errors
-
-    @property
-    def dispatch_queue(self) -> Optional[DispatchQueue]:
-        if self.lead_type == LeadType.ESCALATION:
-            return DispatchQueue.ESCALATION
-        if self.callback_tier == CallbackTier.FAILED:
-            return DispatchQueue.FAILED
-        if self.callback_intent == CallbackIntent.IMMEDIATE:
-            return DispatchQueue.IMMEDIATE
-        if self.callback_intent == CallbackIntent.QUERY:
-            return DispatchQueue.QUERY
-        return None
-
-    @property
-    def should_send_auto_email(self) -> bool:
-        return bool(self.raw.EMAIL and self.is_valid)
-
-    def summary(self) -> dict:
-        return {
-            "run_id":            self.run_id,
-            "ticket_id":         self.raw.TICKET_ID,
-            "lead_type":         self.lead_type,
-            "callback_tier":     self.callback_tier,
-            "callback_intent":   self.callback_intent,
-            "dispatch_queue":    self.dispatch_queue,
-            "status":            self.status,
-            "previous_ticket":   self.previous_ticket_id,
-            "processed_at":      self.processed_at.isoformat(),
-            "validation_errors": self.validation_errors,
-        }
+# Google Sheet Column Mapping (1-indexed for gspread)
+COL_DATE        = 1
+COL_TICKET      = 2
+COL_NAME        = 3
+COL_PHONE       = 4
+COL_EMAIL       = 5
+COL_REASON      = 6
+COL_CSAT        = 7
+COL_LANGUAGE    = 8
+COL_FRUSTRATION = 9
+COL_STATUS      = 10
+COL_PRIOR_TKT   = 11
+COL_INTENT      = 12  # Tracks if it's Immediate or Query
 
 # ============================================================================
-# SECTION 2 — CONFIGURATION
+# GOOGLE SHEETS INTEGRATION (THE CRM)
 # ============================================================================
 
-import os
+def _get_sheet():
+    """Authenticates and returns the main worksheet."""
+    if not GOOGLE_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
+        raise ValueError("Missing Google Sheets credentials.")
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    gc = gspread.service_account_from_dict(creds_dict)
+    return gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
-@dataclass(frozen=True)
-class _EmailConfig:
-    email_api_key: str  = os.getenv("EMAIL_API_KEY", "")
-    sender_email:  str  = os.getenv("SENDER_EMAIL",  "noreply@company.com")
-    team_email:    str  = os.getenv("TEAM_EMAIL",    "team@company.com")
-
-@dataclass(frozen=True)
-class _SchedulerConfig:
-    query_interval_hours:      int = int(os.getenv("QUERY_INTERVAL_H",       "8"))
-    escalation_interval_hours: int = int(os.getenv("ESCALATION_INTERVAL_H", "16"))
-    failed_interval_hours:     int = int(os.getenv("FAILED_INTERVAL_H",     "24"))
-
-@dataclass(frozen=True)
-class _ClassifierConfig:
-    immediate_keywords: FrozenSet[str] = frozenset({
-        "buy", "purchase", "order", "price", "pricing", "quote",
-        "wholesale", "bulk", "negotiate", "negotiation", "deal",
-        "discount", "offer", "payment", "invoice", "checkout",
-        "upgrade", "subscription", "renew",
-    })
-    escalation_keywords: FrozenSet[str] = frozenset({
-        "escalat", "complaint", "refund", "chargeback",
-        "legal", "fraud", "urgent", "critical",
-    })
-
-@dataclass(frozen=True)
-class _PhoneConfig:
-    min_digits: int = 7
-    max_digits: int = 15
-
-@dataclass(frozen=True)
-class _AppConfig:
-    email:      _EmailConfig      = field(default_factory=_EmailConfig)
-    scheduler:  _SchedulerConfig  = field(default_factory=_SchedulerConfig)
-    classifier: _ClassifierConfig = field(default_factory=_ClassifierConfig)
-    phone:      _PhoneConfig      = field(default_factory=_PhoneConfig)
-
-CONFIG = _AppConfig()
-
-# ============================================================================
-# SECTION 3 — CLEANER
-# ============================================================================
-
-_DIGITS_ONLY = re.compile(r"\D")
-_EMAIL_RE    = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
-
-def _clean_str(value: Optional[str]) -> Optional[str]:
-    if value is None: return None
-    cleaned = value.strip()
-    return cleaned or None
-
-def _clean_email(email: Optional[str]) -> Optional[str]:
-    if email is None: return None
-    normalised = email.strip().lower()
-    if not _EMAIL_RE.match(normalised):
-        return None
-    return normalised
-
-def _clean_phone(phone: Optional[str]) -> Optional[str]:
-    if phone is None: return None
-    has_plus = phone.strip().startswith("+")
-    digits   = _DIGITS_ONLY.sub("", phone)
-    n        = len(digits)
-    cfg      = CONFIG.phone
-    if not (cfg.min_digits <= n <= cfg.max_digits):
-        return None
-    return ("+" + digits) if has_plus else digits
-
-def _clean_csat(csat) -> Optional[float]:
-    if csat is None: return None
+def check_for_duplicate(sheet, phone: str, email: str) -> str:
+    """Returns the previous Ticket ID if a duplicate exists, else empty string."""
+    if not phone and not email:
+        return ""
     try:
-        value = float(csat)
-    except (TypeError, ValueError):
-        return None
-    if not (0.0 <= value <= 10.0):
-        return None
-    return round(value, 2)
+        records = sheet.get_all_records()
+        for row in reversed(records):
+            row_phone = str(row.get("PHONE", "") or row.get("Phone", ""))
+            row_email = str(row.get("EMAIL", "") or row.get("Email", ""))
+            if (phone and phone in row_phone) or (email and email.lower() == row_email.lower()):
+                return str(row.get("TICKET_ID", "") or row.get("Ticket ID", ""))
+    except Exception as e:
+        logger.error(f"Error checking for duplicates: {e}")
+    return ""
 
-def _clean_frustration(value) -> Optional[int]:
-    if value is None: return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        score = int(value)
-        if 0 <= score <= 10: return score
-        return None
-    if isinstance(value, str):
-        label_map = {"low": 2, "medium": 5, "high": 8}
-        stripped = value.strip().lower()
-        if stripped in label_map: return label_map[stripped]
-        try:
-            score = int(stripped)
-            if 0 <= score <= 10: return score
-        except ValueError:
-            pass
-    return None
+def update_csat_in_sheet(ticket_id: str, csat_score: float) -> bool:
+    try:
+        sheet = _get_sheet()
+        cell = sheet.find(ticket_id, in_column=COL_TICKET)
+        if cell:
+            sheet.update_cell(cell.row, COL_CSAT, csat_score)
+            logger.info(f"Successfully updated CSAT ({csat_score}) for Ticket #{ticket_id}")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to update CSAT in sheet: {e}")
+    return False
 
-def _clean(lead: RawLead) -> RawLead:
-    return RawLead(
-        NAME        = _clean_str(lead.NAME),
-        PHONE       = _clean_phone(lead.PHONE),
-        EMAIL       = _clean_email(lead.EMAIL),
-        REASON      = _clean_str(lead.REASON),
-        EVENT       = _clean_str(lead.EVENT),
-        TICKET_ID   = _clean_str(lead.TICKET_ID),
-        SESSION_ID  = _clean_str(lead.SESSION_ID),
-        CSAT        = _clean_csat(lead.CSAT),
-        LANGUAGE    = _clean_str(lead.LANGUAGE),
-        FRUSTRATION = _clean_frustration(lead.FRUSTRATION),
-        TURN_COUNT  = lead.TURN_COUNT,
-    )
-
-# ============================================================================
-# SECTION 4 — VALIDATOR
-# ============================================================================
-
-def _validate(lead: RawLead) -> Tuple[bool, List[str]]:
-    errors: List[str] = []
-    if not any([lead.NAME, lead.PHONE, lead.EMAIL]):
-        errors.append("HARD_STOP: No primary contact method (NAME, PHONE, EMAIL all absent).")
-    if not lead.TICKET_ID:
-        errors.append("WARN: TICKET_ID missing — traceability limited.")
-    if not lead.REASON:
-        errors.append("WARN: REASON missing — defaults to QUERY intent.")
-    if not lead.EVENT:
-        errors.append("WARN: EVENT missing — escalation detection skipped.")
-    if lead.CSAT is None:
-        errors.append("WARN: CSAT absent or unparseable.")
-
-    if errors:
-        logger.debug("Validation issues for TICKET_ID=%s: %s", lead.TICKET_ID, "; ".join(errors))
-
-    is_valid = not any(e.startswith("HARD_STOP") for e in errors)
-    return is_valid, errors
+def append_to_google_sheet(lead_data: dict, prior_ticket: str, intent: str, status: str) -> None:
+    try:
+        sheet = _get_sheet()
+        row = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            lead_data.get("TICKET_ID", "N/A"),
+            lead_data.get("NAME", ""),
+            lead_data.get("PHONE", ""),
+            lead_data.get("EMAIL", ""),
+            lead_data.get("REASON", ""),
+            lead_data.get("CSAT", ""),
+            lead_data.get("LANGUAGE", "en"),
+            lead_data.get("FRUSTRATION_SCORE", ""),
+            status,
+            prior_ticket,
+            intent
+        ]
+        sheet.append_row(row)
+        logger.info(f"Added Ticket #{lead_data.get('TICKET_ID')} to CRM. Status: {status}")
+    except Exception as e:
+        logger.error(f"Failed to append to Google Sheets: {e}")
 
 # ============================================================================
-# SECTION 5 — CLASSIFIER
+# EMAIL INTEGRATION (BREVO) & CUSTOM TEMPLATES
 # ============================================================================
 
-def _contains_any(text: Optional[str], keywords: FrozenSet[str]) -> bool:
-    if not text: return False
-    lower = text.lower()
-    return any(kw in lower for kw in keywords)
-
-def _classify(
-    lead: RawLead,
-) -> Tuple[LeadType, Optional[CallbackTier], Optional[CallbackIntent]]:
-    if _contains_any(lead.EVENT, CONFIG.classifier.escalation_keywords):
-        return LeadType.ESCALATION, None, None
-
-    tier = CallbackTier.SUCCESSFUL if any([lead.NAME, lead.PHONE, lead.EMAIL]) else CallbackTier.FAILED
-
-    if tier == CallbackTier.FAILED:
-        return LeadType.CALLBACK, tier, None
-
-    intent = (
-        CallbackIntent.IMMEDIATE
-        if _contains_any(lead.REASON, CONFIG.classifier.immediate_keywords)
-        else CallbackIntent.QUERY
-    )
-    return LeadType.CALLBACK, tier, intent
-
-# ============================================================================
-# SECTION 6 — DEDUPLICATOR
-# ============================================================================
-
-def _deduplicate(lead: ProcessedLead) -> ProcessedLead:
-    r = lead.raw
-    if not r.PHONE and not r.EMAIL:
-        return lead
-
-    prior = db.find_duplicate(phone=r.PHONE, email=r.EMAIL, current_run_id=lead.run_id)
-    if prior is None:
-        return lead
-
-    if prior["status"] == LeadStatus.NOTIFIED:
-        lead.status             = LeadStatus.RECURRING
-        lead.previous_ticket_id = prior["ticket_id"]
-    else:
-        lead.status             = LeadStatus.DUPLICATE
-        lead.previous_ticket_id = prior["ticket_id"]
-
-    return lead
-
-# ============================================================================
-# SECTION 7 — API EMAIL SERVICE (ROCK-SOLID HTTP METHOD)
-# ============================================================================
-
-def _send_email(to: str, subject: str, body_html: str) -> bool:
-    """
-    Sends an email using the Brevo HTTP API via port 443.
-    This bypasses all cloud SMTP restrictions and port blockages.
-    """
-    cfg = CONFIG.email
-    if not cfg.email_api_key:
-        logger.error("EMAIL_API_KEY is not set. Cannot send email.")
+def send_brevo_email(to_email: str, subject: str, html_content: str) -> bool:
+    if not EMAIL_API_KEY:
+        logger.error("EMAIL_API_KEY is not set.")
         return False
 
     payload = {
-        "sender": {"email": cfg.sender_email, "name": "AdiShila Support"},
-        "to": [{"email": to}],
+        "sender": {"email": SENDER_EMAIL, "name": "AdiShila Support"},
+        "to": [{"email": to_email}],
         "subject": subject,
-        "htmlContent": body_html
+        "htmlContent": html_content
     }
-
     headers = {
         "accept": "application/json",
-        "api-key": cfg.email_api_key,
+        "api-key": EMAIL_API_KEY,
         "content-type": "application/json"
     }
 
@@ -367,268 +144,288 @@ def _send_email(to: str, subject: str, body_html: str) -> bool:
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=15) as response:
-            if response.status in (200, 201, 202):
-                logger.info("API Email sent successfully to %s", to)
-                return True
-            else:
-                logger.error("API returned status %s", response.status)
-                return False
-    except Exception as exc:
-        logger.error("Unexpected API email error for %s: %s", to, exc)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.status in (200, 201, 202)
+    except Exception as e:
+        logger.error(f"Failed to send email to {to_email}: {e}")
         return False
 
-
-def _lead_row_html(row: dict) -> str:
-    cells = "".join(
-        f"<td style='padding:4px 8px;border:1px solid #ddd'>{v or ''}</td>"
-        for v in [
-            row.get("ticket_id"),   row.get("name"),     row.get("phone"),
-            row.get("email"),       row.get("reason"),   row.get("status"),
-            row.get("callback_intent") or row.get("lead_type"),
-            row.get("csat"),        row.get("language"), row.get("previous_ticket"),
-        ]
-    )
-    return f"<tr>{cells}</tr>"
-
-
-def _build_batch_html(queue_label: str, leads: List[dict]) -> str:
-    headers = ["Ticket ID","Name","Phone","Email","Reason","Status","Type/Intent","CSAT","Language","Prior Ticket"]
-    header_row = "".join(
-        f"<th style='padding:4px 8px;background:#f5f5f5;border:1px solid #ddd'>{h}</th>"
-        for h in headers
-    )
-    data_rows = "\n".join(_lead_row_html(dict(lead)) for lead in leads)
-    return f"""
-    <html><body>
-    <h2>Lead Dispatch: {queue_label} Queue</h2>
-    <p>Total leads: <strong>{len(leads)}</strong></p>
-    <table style='border-collapse:collapse;font-family:sans-serif;font-size:13px'>
-      <thead><tr>{header_row}</tr></thead>
-      <tbody>{data_rows}</tbody>
-    </table>
-    </body></html>
+def send_customer_confirmation(lead: dict):
+    email = lead.get("EMAIL")
+    if not email: return
+    
+    ticket_id = lead.get("TICKET_ID", "N/A")
+    name = lead.get("NAME", "Customer")
+    phone = lead.get("PHONE", "your registered contact number")
+    date_str = datetime.now().strftime("%B %d, %Y")
+    
+    subject = f"We've Received Your Callback Request – Ticket #{ticket_id}"
+    body = f"""
+    <div style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; max-width: 600px; margin: 0 auto;">
+        <p>Dear {name},</p>
+        <p>Thank you for reaching out to Adishila! 🙏</p>
+        <p>We have successfully received your callback request, and we want you to know that your query is important to us.</p>
+        
+        <div style="border-top: 2px solid #ddd; border-bottom: 2px solid #ddd; padding: 15px 0; margin: 25px 0;">
+            <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: bold;">📋 Your Ticket Details</h3>
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr><td style="padding: 4px 0; width: 120px; color: #555;">Ticket ID</td><td style="padding: 4px 0; font-weight: bold;">: #{ticket_id}</td></tr>
+                <tr><td style="padding: 4px 0; color: #555;">Request Date</td><td style="padding: 4px 0; font-weight: bold;">: {date_str}</td></tr>
+                <tr><td style="padding: 4px 0; color: #555;">Status</td><td style="padding: 4px 0; font-weight: bold;">: Under Review</td></tr>
+            </table>
+        </div>
+        
+        <p>Our dedicated support team will get in touch with you within the next 48 hours on your registered contact number: <strong>{phone}</strong> or email.</p>
+        <p>In the meantime, if you have any additional information to share or wish to update your query, feel free to reply to this email quoting your Ticket ID.</p>
+        <p>We appreciate your patience and look forward to assisting you!</p>
+        
+        <p style="margin-top: 30px;">
+            Warm regards,<br><strong>Customer Support Team</strong><br>Adishila.in<br>
+            📧 support@adishila.in<br>🌐 www.adishila.in<br>📞 {SUPPORT_PHONE}
+        </p>
+    </div>
     """
+    send_brevo_email(email, subject, body)
 
-def _send_customer_confirmation(lead: ProcessedLead) -> bool:
-    r       = lead.raw
-    subject = f"We've received your request — Ticket #{r.TICKET_ID}"
-    body    = f"""
-    <html><body>
-    <p>Hi {r.NAME or 'there'},</p>
-    <p>Thank you for reaching out. Your request has been logged.</p>
-    <p><strong>Ticket ID:</strong> {r.TICKET_ID}<br>
-       <strong>Session ID:</strong> {r.SESSION_ID or 'N/A'}</p>
-    <p>A member of our team will follow up with you shortly.</p>
-    <p>— The Support Team</p>
-    </body></html>
+def send_immediate_team_notification(lead: dict, prior_ticket: str, intent: str, display_status: str):
+    ticket_id = lead.get("TICKET_ID", "N/A")
+    date_str = datetime.now().strftime("%d-%b-%Y")
+    
+    # Highlight the subject line if it's a reorder to grab attention immediately
+    subject_prefix = "REORDER" if "Reorder" in display_status else "Callback Assignment"
+    subject = f"{subject_prefix} | Ticket #{ticket_id} | {intent} | {date_str}"
+    
+    body = f"""
+    <div style="font-family: Arial, sans-serif; color: #333; line-height: 1.5; max-width: 650px;">
+        <p>Dear Resolution Team,</p>
+        <p>A new callback request has been assigned to your queue. Please find the customer details below and ensure contact is made within 48 hours.</p>
+        
+        <div style="background-color: #fcfcfc; border: 1px solid #ddd; padding: 20px; margin: 20px 0;">
+            <h3 style="margin: 0 0 15px 0; font-size: 15px; font-weight: bold; border-bottom: 1px solid #ccc; padding-bottom: 10px;">📋 CUSTOMER CALLBACK DETAILS</h3>
+            <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                <tr><td style="padding: 4px 0; width: 140px; color: #555;">Ticket ID</td><td style="padding: 4px 0;">: <strong>#{ticket_id}</strong></td></tr>
+                <tr><td style="padding: 4px 0; color: #555;">Name</td><td style="padding: 4px 0;">: {lead.get('NAME', 'N/A')}</td></tr>
+                <tr><td style="padding: 4px 0; color: #555;">Phone</td><td style="padding: 4px 0;">: {lead.get('PHONE', 'N/A')}</td></tr>
+                <tr><td style="padding: 4px 0; color: #555;">Email</td><td style="padding: 4px 0;">: {lead.get('EMAIL', 'N/A')}</td></tr>
+                <tr><td style="padding: 4px 0; color: #555;">Reason</td><td style="padding: 4px 0;">: {lead.get('REASON', 'N/A')}</td></tr>
+                <tr><td style="padding: 4px 0; color: #555;">Status</td><td style="padding: 4px 0; color: #d35400; font-weight: bold;">: {display_status}</td></tr>
+                <tr><td style="padding: 4px 0; color: #555;">Type / Intent</td><td style="padding: 4px 0;">: {intent}</td></tr>
+                <tr><td style="padding: 4px 0; color: #555;">Prior Ticket ID</td><td style="padding: 4px 0;">: {prior_ticket or 'N/A'}</td></tr>
+            </table>
+        </div>
+        
+        <p style="margin: 10px 0 5px 0; font-weight: bold;">⚠️ Action Required:</p>
+        <ul style="margin-top: 0; padding-left: 20px;">
+            <li style="margin-bottom: 5px;">If a Prior Ticket ID is listed, please review the previous interaction history before reaching out.</li>
+            <li style="margin-bottom: 5px;">Update the ticket status in the Google Sheets CRM after every interaction.</li>
+        </ul>
+        <p>Regards,<br>Automated Dispatch System<br>Adishila.in</p>
+    </div>
     """
-    logger.info("Sending API auto-confirm to %s (ticket %s)", r.EMAIL, r.TICKET_ID)
-    return _send_email(r.EMAIL, subject, body)
+    send_brevo_email(TEAM_EMAIL, subject, body)
 
-def _dispatch_immediate(lead: ProcessedLead) -> bool:
-    r       = lead.raw
-    subject = f"[IMMEDIATE LEAD] {r.NAME or 'Unknown'} — Ticket #{r.TICKET_ID}"
-    body    = _build_batch_html("Immediate", [lead.summary()])
-    logger.info("Dispatching IMMEDIATE lead ticket=%s via API", r.TICKET_ID)
-    return _send_email(CONFIG.email.team_email, subject, body)
-
-def _dispatch_batch(queue_label: str, leads: List) -> bool:
+def send_batch_team_notification(leads: list) -> bool:
     if not leads:
         return True
-    subject = f"[{queue_label.upper()} BATCH] {len(leads)} lead(s) pending action"
-    body    = _build_batch_html(queue_label, leads)
-    logger.info("Dispatching %s batch via API: %d lead(s)", queue_label, len(leads))
-    return _send_email(CONFIG.email.team_email, subject, body)
-
-# ============================================================================
-# SECTION 8 — SCHEDULER
-# ============================================================================
-
-_scheduler = BackgroundScheduler(timezone="UTC")
-
-def _make_batch_job(queue: DispatchQueue) -> Callable:
-    def job() -> None:
-        label = queue.value.capitalize()
-        logger.info("Running batch job: %s queue", label)
-        leads = db.fetch_pending_by_queue(queue.value)
-        if not leads:
-            logger.info("%s batch: nothing to send.", label)
-            return
-        if _dispatch_batch(label, leads):
-            run_ids = [row["run_id"] for row in leads]
-            db.mark_notified(run_ids)
-            logger.info("%s batch: %d lead(s) dispatched & marked Notified.", label, len(leads))
-        else:
-            logger.error("%s batch: dispatch FAILED — leads remain pending.", label)
-
-    job.__name__ = f"batch_job_{queue.value}"
-    return job
-
-def _start_scheduler() -> None:
-    cfg  = CONFIG.scheduler
-    jobs = [
-        (DispatchQueue.QUERY,      cfg.query_interval_hours),
-        (DispatchQueue.ESCALATION, cfg.escalation_interval_hours),
-        (DispatchQueue.FAILED,     cfg.failed_interval_hours),
-    ]
-    for queue, hours in jobs:
-        _scheduler.add_job(
-            func             = _make_batch_job(queue),
-            trigger          = IntervalTrigger(hours=hours),
-            id               = f"batch_{queue.value}",
-            name             = f"Batch dispatch — {queue.value} (every {hours}h)",
-            replace_existing = True,
-            max_instances    = 1,     
-            misfire_grace_time = 300, 
-        )
-        logger.info("Scheduled: %s queue every %dh", queue.value, hours)
-    _scheduler.start()
-    logger.info("Background scheduler started (UTC).")
-
-def stop_scheduler() -> None:
-    if _scheduler.running:
-        _scheduler.shutdown(wait=False)
-        logger.info("Scheduler stopped.")
-
-# ============================================================================
-# SECTION 9 — PIPELINE ORCHESTRATOR
-# ============================================================================
-
-def initialise() -> None:
-    db.initialise_db()
-    _start_scheduler()
-
-def process_lead(payload: Dict[str, Any]) -> ProcessedLead:
-    lead = ProcessedLead(raw=RawLead.from_dict(payload))
-    lead.raw = _clean(lead.raw)
-
-    is_valid, errors = _validate(lead.raw)
-    lead.validation_errors = errors
-
-    if is_valid:
-        lead.lead_type, lead.callback_tier, lead.callback_intent = _classify(lead.raw)
-    else:
-        lead.lead_type     = LeadType.CALLBACK
-        lead.callback_tier = CallbackTier.FAILED
-        logger.warning(
-            "TICKET_ID=%s failed validation → Failed queue. Errors: %s",
-            lead.raw.TICKET_ID, errors,
-        )
-
-    lead = _deduplicate(lead)
-    db.upsert_lead(lead)
+        
+    date_str = datetime.now().strftime("%d-%b-%Y")
+    total_count = len(leads)
     
-    logger.info(
-        "Lead persisted | ticket=%s | type=%s | queue=%s | status=%s",
-        lead.raw.TICKET_ID, lead.lead_type, lead.dispatch_queue, lead.status,
-    )
+    subject = f"Daily Callback Assignment | {total_count} Tickets | {date_str}"
+    
+    data_rows = ""
+    for row in leads:
+        data_rows += f"""
+        <tr>
+          <td style="padding: 8px; border: 1px solid #ddd; white-space: nowrap;">#{row.get('ticket_id', '')}</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('name', 'N/A')}</td>
+          <td style="padding: 8px; border: 1px solid #ddd; white-space: nowrap;">{row.get('phone', 'N/A')}</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('email', 'N/A')}</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('reason', 'N/A')}</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('status', '')}</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('intent', 'Query')}</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">{row.get('language', 'N/A')}</td>
+          <td style="padding: 8px; border: 1px solid #ddd; white-space: nowrap;">{row.get('previous_ticket') or 'N/A'}</td>
+        </tr>
+        """
 
-    if lead.should_send_auto_email:
-        ok = _send_customer_confirmation(lead)
-        if not ok:
-            logger.warning("Auto-confirm FAILED for TICKET_ID=%s EMAIL=%s", lead.raw.TICKET_ID, lead.raw.EMAIL)
-
-    if lead.dispatch_queue == DispatchQueue.IMMEDIATE:
-        if _dispatch_immediate(lead):
-            db.mark_notified([lead.run_id])
-            lead.status = LeadStatus.NOTIFIED
-        else:
-            logger.error("Immediate dispatch FAILED for TICKET_ID=%s", lead.raw.TICKET_ID)
-
-    return lead
+    body = f"""
+    <div style="font-family: Arial, sans-serif; color: #333; line-height: 1.5; max-width: 95%;">
+        <p>Dear Resolution Team,</p>
+        <p>Please find below the callback requests assigned to your queue for {date_str}. All customers must be contacted within 48 hours of their respective ticket creation time.</p>
+        
+        <div style="background-color: #fcfcfc; border: 1px solid #ddd; padding: 20px; margin: 20px 0; max-width: 400px;">
+            <h3 style="margin: 0 0 15px 0; font-size: 15px; font-weight: bold; border-bottom: 1px solid #ccc; padding-bottom: 10px;">📊 ASSIGNMENT SUMMARY</h3>
+            <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                <tr><td style="padding: 4px 0; color: #555;">Total New Tickets</td><td style="padding: 4px 0;">: <strong>{total_count}</strong></td></tr>
+            </table>
+        </div>
+        
+        <h3 style="margin: 25px 0 10px 0; font-size: 15px;">📋 CUSTOMER CALLBACK TABLE</h3>
+        <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; min-width: 900px;">
+                <thead>
+                    <tr style="background-color: #f5f5f5;">
+                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Ticket ID</th>
+                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Name</th>
+                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Phone</th>
+                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Email</th>
+                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Reason</th>
+                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Status</th>
+                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Intent</th>
+                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Language</th>
+                        <th style="padding: 10px 8px; border: 1px solid #ddd;">Prior Ticket</th>
+                    </tr>
+                </thead>
+                <tbody>{data_rows}</tbody>
+            </table>
+        </div>
+        <p>Regards,<br>Automated Dispatch System<br>Adishila.in</p>
+    </div>
+    """
+    logger.info(f"Dispatching batch email via API for {total_count} leads.")
+    return send_brevo_email(TEAM_EMAIL, subject, body)
 
 # ============================================================================
-# SECTION 10 — WEBHOOK SERVER
+# WEBHOOK SERVER & ENDPOINTS
 # ============================================================================
 
-_flask_app = Flask(__name__)
-_WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
+app = Flask(__name__)
 
-def _verify_signature(body: bytes, sig_header: str) -> bool:
-    if not _WEBHOOK_SECRET:
-        return True
-    expected = "sha256=" + hmac.new(
-        _WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256
-    ).hexdigest()
+def verify_signature(body: bytes, sig_header: str) -> bool:
+    if not WEBHOOK_SECRET: return True
+    expected = "sha256=" + hmac.new(WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, sig_header or "")
 
-@_flask_app.route("/health", methods=["GET"])
+@app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status":            "ok",
-        "scheduler_running": _scheduler.running,
-        "db_path":           os.getenv("DB_PATH", "leads.db"),
-    }), 200
+    return jsonify({"status": "ok", "mode": "google_sheets_batching_reorders"}), 200
 
-@_flask_app.route("/leads/pending", methods=["GET"])
-def leads_pending():
-    counts = {}
-    for queue in DispatchQueue:
-        rows = db.fetch_pending_by_queue(queue.value)
-        counts[queue.value] = len(rows)
-    return jsonify({"pending": counts}), 200
-
-@_flask_app.route("/webhook/lead", methods=["POST"])
+@app.route("/webhook/lead", methods=["POST"])
 def webhook_lead():
-    sig_header = request.headers.get("X-Hub-Signature-256", "")
-    if not _verify_signature(request.data, sig_header):
+    if not verify_signature(request.data, request.headers.get("X-Hub-Signature-256", "")):
         return jsonify({"error": "invalid signature"}), 401
 
-    payload = request.get_json(force=True, silent=True)
-    if not payload:
-        return jsonify({"error": "request body must be valid JSON"}), 400
+    payload = request.get_json(force=True, silent=True) or {}
+    
+    # Flatten format
+    lead_data = {k: v for k, v in payload.items() if k != "callback_data"}
+    lead_data.update(payload.get("callback_data") or {})
+    lead_data = {k.upper(): v for k, v in lead_data.items()}
+    
+    ticket_id = lead_data.get("TICKET_ID")
+    
+    # Check if this is just a CSAT update coming 10 seconds later
+    is_csat_only = lead_data.get("CSAT") is not None and not any([lead_data.get("NAME"), lead_data.get("PHONE"), lead_data.get("EMAIL")])
+    if is_csat_only:
+        update_csat_in_sheet(ticket_id, lead_data.get("CSAT"))
+        return jsonify({"status": "csat_updated"}), 200
 
-    logger.info(
-        "Webhook: payload received from %s | event=%s | ticket=%s",
-        request.remote_addr,
-        payload.get("event", "—"),
-        (payload.get("callback_data") or payload).get("ticket_id", "—"),
-    )
+    # 1. Check Contactability (The "Ghost Lead" Check)
+    has_contact = bool(lead_data.get("PHONE") or lead_data.get("EMAIL"))
+
+    # 2. Determine Intent
+    reason = str(lead_data.get("REASON", "")).lower()
+    intent = "Immediate" if any(kw in reason for kw in IMMEDIATE_KEYWORDS) else "Query"
+
+    # 3. Check Deduplication
+    try:
+        sheet = _get_sheet()
+        prior_ticket = check_for_duplicate(sheet, lead_data.get("PHONE"), lead_data.get("EMAIL"))
+    except Exception:
+        prior_ticket = ""
+
+    # 4. Determine Dynamic Statuses
+    # We separate 'crm_status' (how the batcher reads it) from 'email_status' (what humans read).
+    if not has_contact:
+        crm_status = "Unreachable"
+        email_status = "Unreachable"
+        logger.info(f"Ticket #{ticket_id} is unreachable. CRM logged, emails bypassed.")
+    elif intent == "Immediate":
+        if prior_ticket:
+            crm_status = "Notified (Reorder)"
+            email_status = "Reorder (High Priority)"
+        else:
+            crm_status = "Notified (Immediate)"
+            email_status = "New (High Priority)"
+    else:
+        # intent == "Query"
+        crm_status = "Recurring" if prior_ticket else "New"
+        email_status = crm_status
+
+    # 5. Save to CRM (All leads get logged, regardless of contactability)
+    append_to_google_sheet(lead_data, prior_ticket, intent, crm_status)
+
+    # 6. Send Emails (Only if contactable)
+    if lead_data.get("EMAIL"):
+        send_customer_confirmation(lead_data)
+        
+    if intent == "Immediate" and has_contact:
+        send_immediate_team_notification(lead_data, prior_ticket, intent, email_status)
+
+    return jsonify({"status": "success", "intent": intent, "contactable": has_contact, "crm_status": crm_status}), 200
+
+@app.route("/cron/batch", methods=["GET", "POST"])
+def process_batches():
+    """
+    Endpoint triggered by an external cron service.
+    Finds all un-notified leads in Google Sheets, sends a batch email, 
+    and updates their status to 'Notified'.
+    """
+    provided_key = request.args.get("key")
+    if WEBHOOK_SECRET and provided_key != WEBHOOK_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
 
     try:
-        result = process_lead(payload)
-    except Exception as exc:
-        logger.exception("Webhook: unhandled exception in process_lead: %s", exc)
-        return jsonify({"error": "internal processing error", "detail": str(exc)}), 500
+        sheet = _get_sheet()
+        records = sheet.get_all_records()
+        
+        pending_leads = []
+        rows_to_update = []
+        
+        # Row 1 is headers, so data starts at Row 2
+        for idx, row in enumerate(records, start=2):
+            status = str(row.get("Status", row.get("STATUS", "")))
+            
+            # Grabs only standard priority items waiting for batching
+            if status in ["New", "Recurring"]:
+                pending_leads.append({
+                    "ticket_id": row.get("Ticket ID", row.get("TICKET_ID", "")),
+                    "name": row.get("Name", row.get("NAME", "")),
+                    "phone": row.get("Phone", row.get("PHONE", "")),
+                    "email": row.get("Email", row.get("EMAIL", "")),
+                    "reason": row.get("Reason", row.get("REASON", "")),
+                    "status": status,
+                    "intent": row.get("Intent", row.get("INTENT", "Query")),
+                    "language": row.get("Language", row.get("LANGUAGE", "en")),
+                    "previous_ticket": row.get("Prior Ticket ID", row.get("PRIOR_TKT", ""))
+                })
+                rows_to_update.append(idx)
 
-    summary = result.summary()
-    http_status = 422 if result.validation_errors and any(
-        e.startswith("HARD_STOP") for e in result.validation_errors
-    ) else 200
+        # STRICT ZERO-REQUEST SAFEGUARD
+        if not pending_leads:
+            logger.info("Batch dispatcher ran: 0 new leads. Skipping team email.")
+            return jsonify({
+                "status": "no_pending_leads", 
+                "message": "0 requests found, team not pinged"
+            }), 200
 
-    return jsonify(summary), http_status
+        # Send the massive table email
+        email_success = send_batch_team_notification(pending_leads)
+        
+        if email_success:
+            for row_idx in rows_to_update:
+                sheet.update_cell(row_idx, COL_STATUS, "Notified")
+            
+            logger.info(f"Successfully processed batch of {len(pending_leads)} leads.")
+            return jsonify({"status": "batch_sent", "count": len(pending_leads)}), 200
+        else:
+            return jsonify({"error": "Failed to send batch email"}), 500
 
-# ============================================================================
-# SECTION 11 — GRACEFUL SHUTDOWN
-# ============================================================================
-
-def _on_shutdown(*_) -> None:
-    stop_scheduler()
-
-atexit.register(_on_shutdown)
-signal.signal(signal.SIGTERM, _on_shutdown)
-
-# ============================================================================
-# SECTION 12 — ENTRY POINT
-# ============================================================================
-
-def run_server(host: str = "0.0.0.0", port: int = 8000, debug: bool = False) -> None:
-    initialise()
-    logger.info("Starting webhook server on %s:%d (debug=%s)", host, port, debug)
-    try:
-        _flask_app.run(host=host, port=port, debug=debug, use_reloader=False)
-    finally:
-        _on_shutdown()
-
-if os.getenv("RENDER"):
-    initialise()
+    except Exception as e:
+        logger.error(f"Batch dispatch failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Lead pipeline webhook server")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
-    run_server(host=args.host, port=args.port, debug=args.debug)
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
