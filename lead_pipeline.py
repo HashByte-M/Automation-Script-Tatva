@@ -92,13 +92,11 @@ from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, jsonify, request
 
 import database as db
-
- logging.basicConfig(
+logging.basicConfig(
         level   = logging.INFO,
         format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         datefmt = "%Y-%m-%d %H:%M:%S",
     )
-
 logger = logging.getLogger(__name__)
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
