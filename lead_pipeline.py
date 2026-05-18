@@ -43,6 +43,10 @@ GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID")
 # Keywords for classification
 IMMEDIATE_KEYWORDS = ["buy", "purchase", "order", "price", "pricing", "quote", "wholesale", "urgent"]
 
+# Google Form — pre-fill base URL for pipeline stage updates
+# Replace FORM_ID and ENTRY_TICKET_ID with your actual values from the form's pre-fill link
+FORM_BASE_URL = "https://docs.google.com/forms/d/e/1FAIpQLSfbcez3LZvaLRXIioeO6CIMqmZhteULntiNgYx3Np23CCl0mQ/viewform?usp=pp_url&entry.215603920="
+
 # Google Sheet Column Mapping (1-indexed for gspread)
 COL_DATE        = 1
 COL_TICKET      = 2
@@ -56,6 +60,8 @@ COL_PRIOR_TKT   = 9
 COL_CSAT        = 10
 COL_FRUSTRATION = 11
 COL_INTENT      = 12
+COL_PIPELINE    = 13
+COL_COMMENTS    = 14
 
 # ============================================================================
 # GOOGLE SHEETS INTEGRATION (THE CRM)
@@ -98,6 +104,18 @@ def check_for_duplicate(sheet, phone: str, email: str) -> str:
 def append_to_google_sheet(lead_data: dict, prior_ticket: str, intent: str, status: str) -> None:
     try:
         sheet = _get_sheet()
+
+        # Auto-derive the starting pipeline stage from the CRM status
+        stage_map = {
+            "Unreachable":            "Unreachable",
+            "CSAT Only (No Contact)": "CSAT Only",
+            "New":                    "Cold",
+            "Recurring":              "Cold",
+            "Notified (Immediate)":   "Cold",
+            "Notified (Reorder)":     "Cold",
+        }
+        pipeline_stage = stage_map.get(status, "Cold")
+
         row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             lead_data.get("TICKET_ID") or "N/A",
@@ -110,10 +128,12 @@ def append_to_google_sheet(lead_data: dict, prior_ticket: str, intent: str, stat
             prior_ticket or "N/A",
             lead_data.get("CSAT") or "N/A",
             lead_data.get("FRUSTRATION_SCORE") or "N/A",
-            intent or "N/A"
+            intent or "N/A",
+            pipeline_stage,  # Col 13 — auto-set on arrival
+            ""               # Col 14 — Comments, blank on arrival, filled via Google Form
         ]
         sheet.append_row(row)
-        logger.info(f"Added Ticket #{lead_data.get('TICKET_ID')} to CRM. Status: {status}")
+        logger.info(f"Added Ticket #{lead_data.get('TICKET_ID')} to CRM. Status: {status} | Pipeline: {pipeline_stage}")
     except Exception as e:
         logger.error(f"Failed to append to Google Sheets: {e}")
 
@@ -207,6 +227,9 @@ def send_immediate_team_notification(lead: dict, prior_ticket: str, intent: str,
     
     subject_prefix = "REORDER" if "Reorder" in display_status else "URGENT ASSIGNMENT"
     subject = f"{subject_prefix} | Ticket #{ticket_id} | {intent} | {date_str}"
+
+    # Pre-filled Google Form link — Ticket ID is baked in, team just picks stage + adds comment
+    form_link = f"{FORM_BASE_URL}{ticket_id}"
     
     body = f"""
     <div style="font-family: 'Inter', Arial, sans-serif; background-color: #0E0E0E; color: #FAF7F2; line-height: 1.5; max-width: 650px; margin: 0 auto; padding: 30px;">
@@ -237,8 +260,17 @@ def send_immediate_team_notification(lead: dict, prior_ticket: str, intent: str,
             <p style="margin: 0 0 8px 0; font-weight: bold; color: #C8A96E; font-size: 13px;">⚠️ Action Required:</p>
             <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: #9A9286;">
                 <li style="margin-bottom: 5px;">If a Prior Ticket ID is listed, review interaction history before calling.</li>
-                <li>Update ticket status in the Google Sheets CRM after every interaction.</li>
+                <li>After each interaction, update the pipeline stage and add your notes using the button below.</li>
             </ul>
+        </div>
+
+        <div style="text-align: center; margin: 30px 0; padding: 25px; background-color: #1A1A1A; border: 1px solid rgba(200,169,110,0.2);">
+            <p style="color: #9A9286; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; margin: 0 0 15px 0;">Update Pipeline Stage & Add Notes</p>
+            <a href="{form_link}"
+               style="display: inline-block; padding: 14px 32px; background-color: #C8A96E; color: #0E0E0E; font-weight: 700; text-decoration: none; font-size: 14px; letter-spacing: 1px;">
+                📋 Update Ticket #{ticket_id}
+            </a>
+            <p style="color: #9A9286; font-size: 11px; margin: 12px 0 0 0;">Ticket ID is pre-filled — just select the stage and add your notes.</p>
         </div>
         
         <p style="font-size: 12px; color: #9A9286;">Regards,<br>Automated Dispatch System<br>AdiShila</p>
@@ -257,9 +289,11 @@ def send_batch_team_notification(leads: list) -> bool:
     
     data_rows = ""
     for row in leads:
+        ticket_id = row.get('ticket_id', '')
+        form_link = f"{FORM_BASE_URL}{ticket_id}"
         data_rows += f"""
         <tr style="border-bottom: 1px solid #3D3D3D;">
-          <td style="padding: 12px 8px; color: #C8A96E; white-space: nowrap;">#{row.get('ticket_id', '')}</td>
+          <td style="padding: 12px 8px; color: #C8A96E; white-space: nowrap;">#{ticket_id}</td>
           <td style="padding: 12px 8px; color: #FAF7F2;">{row.get('name', 'N/A')}</td>
           <td style="padding: 12px 8px; color: #FAF7F2; white-space: nowrap;">{row.get('phone', 'N/A')}</td>
           <td style="padding: 12px 8px; color: #FAF7F2;">{row.get('email', 'N/A')}</td>
@@ -268,6 +302,12 @@ def send_batch_team_notification(leads: list) -> bool:
           <td style="padding: 12px 8px; color: #FAF7F2;">{row.get('intent', 'Query')}</td>
           <td style="padding: 12px 8px; color: #FAF7F2;">{row.get('language', 'N/A')}</td>
           <td style="padding: 12px 8px; color: #9A9286; white-space: nowrap;">{row.get('previous_ticket') or 'N/A'}</td>
+          <td style="padding: 12px 8px; text-align: center;">
+            <a href="{form_link}"
+               style="display: inline-block; padding: 6px 14px; background-color: #C8A96E; color: #0E0E0E; font-weight: 700; text-decoration: none; font-size: 11px; white-space: nowrap;">
+              📋 Update
+            </a>
+          </td>
         </tr>
         """
 
@@ -281,9 +321,10 @@ def send_batch_team_notification(leads: list) -> bool:
 
         <p style="color: #E8E4DC;">Dear Resolution Team,</p>
         <p style="color: #9A9286; font-size: 14px;">Please find below the callback requests assigned to your queue for today. All customers must be contacted within 48 hours of their respective ticket creation time.</p>
+        <p style="color: #9A9286; font-size: 14px;">After each interaction, click <strong style="color: #C8A96E;">📋 Update</strong> on the relevant row to update the pipeline stage and add your notes. The Ticket ID is pre-filled — no sheet access required.</p>
         
         <div style="overflow-x: auto; margin-top: 30px;">
-            <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; min-width: 900px; background-color: #1A1A1A; border: 1px solid #3D3D3D;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; min-width: 1000px; background-color: #1A1A1A; border: 1px solid #3D3D3D;">
                 <thead>
                     <tr style="background-color: rgba(200,169,110,0.1); border-bottom: 2px solid #C8A96E;">
                         <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Ticket ID</th>
@@ -295,6 +336,7 @@ def send_batch_team_notification(leads: list) -> bool:
                         <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Intent</th>
                         <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Language</th>
                         <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px;">Prior Ticket</th>
+                        <th style="padding: 12px 8px; color: #C8A96E; font-weight: normal; letter-spacing: 1px; text-transform: uppercase; font-size: 11px; text-align: center;">Update CRM</th>
                     </tr>
                 </thead>
                 <tbody>{data_rows}</tbody>
