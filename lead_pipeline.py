@@ -74,7 +74,7 @@ def _get_sheet():
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     gc = gspread.service_account_from_dict(creds_dict)
     try:
-        return gc.open_by_key(GOOGLE_SHEET_ID).sheet1
+        return gc.open_by_key(GOOGLE_SHEET_ID).worksheet("Sheet 1")
     except Exception as e:
         if "404" in str(e) or "SpreadsheetNotFound" in str(type(e).__name__):
             logger.error("CRITICAL: Google Sheet 404 Not Found! Ensure GOOGLE_SHEET_ID is correct and the service account email is added as an Editor.")
