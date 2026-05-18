@@ -322,6 +322,16 @@ def verify_signature(body: bytes, sig_header: str) -> bool:
 def health():
     return jsonify({"status": "ok", "mode": "google_sheets_batching_reorders"}), 200
 
+# --- NEW PING ROUTE ADDED HERE ---
+@_flask_app.route("/ping", methods=["GET", "HEAD"])
+def ping():
+    """
+    Extremely lightweight endpoint designed specifically for external cron services 
+    to hit in order to keep the server awake. Returns a tiny payload to avoid 
+    'output too large' errors.
+    """
+    return "OK", 200
+
 @_flask_app.route("/webhook/lead", methods=["POST"])
 def webhook_lead():
     if not verify_signature(request.data, request.headers.get("X-Hub-Signature-256", "")):
